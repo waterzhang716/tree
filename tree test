@@ -1,0 +1,199 @@
+import React, { useMemo, useRef, useState, useEffect } from 'react';
+import * as THREE from 'three';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { 
+  Float, 
+  Html, 
+  Environment, 
+  PerspectiveCamera, 
+  useTexture,
+  Sphere
+} from '@react-three/drei';
+import { EffectComposer, Bloom, Noise, Vignette } from '@react-three/postprocessing';
+import { Hands, Results } from '@mediapipe/hands';
+
+// --- 配置參數 ---
+const PARTICLE_COUNT = 12000;
+const PHOTO_COUNT = 8;
+const GOLD_COLOR = "#D4AF37";
+const EMERALD_COLOR = "#043927";
+
+// --- 1. 手勢追蹤 Hook ---
+const useHandTracking = () => {
+  const [isOpen, setIsOpen] = useState(false);
+  const [handPos, setHandPos] = useState({ x: 0, y: 0 });
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    const video = document.createElement('video');
+    video.style.display = 'none';
+    document.body.appendChild(video);
+
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+    });
+
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7 });
+    hands.onResults((results: Results) => {
+      if (results.multiHandLandmarks.length > 0) {
+        const hand = results.multiHandLandmarks[0];
+        // 判斷食指尖端與手掌根部距離
+        const distance = Math.sqrt(Math.pow(hand[8].x - hand[0].x, 2) + Math.pow(hand[8].y - hand[0].y, 2));
+        setIsOpen(distance > 0.4); 
+        setHandPos({ x: (hand[9].x - 0.5) * 2, y: -(hand[9].y - 0.5) * 2 });
+      }
+    });
+
+    navigator.mediaDevices.getUserMedia({ video: true }).then((stream) => {
+      video.srcObject = stream;
+      video.play();
+      const predict = async () => {
+        await hands.send({ image: video });
+        requestAnimationFrame(predict);
+      };
+      predict();
+    });
+  }, []);
+
+  return { isOpen, handPos };
+};
+
+// --- 2. 拍立得照片組件 ---
+const PolaroidPhoto = ({ index, total, stateProgress }: { index: number, total: number, stateProgress: number }) => {
+  const angle = (index / total) * Math.PI * 2;
+  const targetPos = new THREE.Vector3(Math.cos(angle) * 3, (index - total/2) * 1.2, Math.sin(angle) * 3);
+  const chaosPos = new THREE.Vector3((Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20);
+  
+  const currentPos = new THREE.Vector3().lerpVectors(chaosPos, targetPos, stateProgress);
+
+  return (
+    <Float speed={2} rotationIntensity={0.5} floatIntensity={1}>
+      <Html position={[currentPos.x, currentPos.y, currentPos.z]} transform occlude>
+        <div className="w-24 h-32 bg-white p-1 shadow-2xl border-b-8 border-white flex flex-col items-center">
+          <div className="w-full h-24 bg-gray-200 overflow-hidden">
+             <img src={`https://picsum.photos/seed/${index + 10}/100/100`} alt="memory" className="w-full h-full object-cover grayscale hover:grayscale-0 transition-all" />
+          </div>
+          <span className="text-[8px] mt-1 font-serif text-gray-500 italic">Christmas 2025</span>
+        </div>
+      </Html>
+    </Float>
+  );
+};
+
+// --- 3. 核心聖誕樹粒子系統 ---
+const TreeParticles = ({ isOpen, handPos }: { isOpen: boolean, handPos: { x: number, y: number } }) => {
+  const pointsRef = useRef<THREE.Points>(null);
+  const [lerpVal] = useState(() => new THREE.Vector3(0, 0, 0));
+
+  const { positions, targets } = useMemo(() => {
+    const pos = new Float32Array(PARTICLE_COUNT * 3);
+    const tgt = new Float32Array(PARTICLE_COUNT * 3);
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      // Chaos Position
+      pos[i * 3] = (Math.random() - 0.5) * 30;
+      pos[i * 3 + 1] = (Math.random() - 0.5) * 30;
+      pos[i * 3 + 2] = (Math.random() - 0.5) * 30;
+
+      // Tree Shape (Cone)
+      const h = Math.random() * 15;
+      const r = (15 - h) * 0.25;
+      const a = Math.random() * Math.PI * 2;
+      tgt[i * 3] = Math.cos(a) * r;
+      tgt[i * 3 + 1] = h - 7;
+      tgt[i * 3 + 2] = Math.sin(a) * r;
+    }
+    return { positions: pos, targets: tgt };
+  }, []);
+
+  useFrame((state, delta) => {
+    const targetState = isOpen ? 0 : 1;
+    lerpVal.x = THREE.MathUtils.lerp(lerpVal.x, targetState, 0.05);
+
+    if (pointsRef.current) {
+      const p = pointsRef.current.geometry.attributes.position.array as Float32Array;
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const idx = i * 3;
+        p[idx] = THREE.MathUtils.lerp(p[idx], lerpVal.x === 1 ? targets[idx] : positions[idx], 0.1);
+        p[idx+1] = THREE.MathUtils.lerp(p[idx+1], lerpVal.x === 1 ? targets[idx+1] : positions[idx+1], 0.1);
+        p[idx+2] = THREE.MathUtils.lerp(p[idx+2], lerpVal.x === 1 ? targets[idx+2] : positions[idx+2], 0.1);
+      }
+      pointsRef.current.geometry.attributes.position.needsUpdate = true;
+    }
+
+    // 相機平滑跟隨手勢
+    state.camera.position.lerp(new THREE.Vector3(handPos.x * 5, 5 + handPos.y * 2, 25), 0.05);
+    state.camera.lookAt(0, 0, 0);
+  });
+
+  return (
+    <group>
+      <points ref={pointsRef}>
+        <bufferGeometry>
+          <bufferAttribute attach="attributes-position" count={PARTICLE_COUNT} array={positions} itemSize={3} />
+        </bufferGeometry>
+        <pointsMaterial size={0.08} color={EMERALD_COLOR} transparent opacity={0.8} blending={THREE.AdditiveBlending} />
+      </points>
+      
+      {/* 聖誕星 */}
+      {!isOpen && (
+        <mesh position={[0, 8.5, 0]}>
+          <starGeometry args={[0.5, 1.2, 5]} />
+          <meshStandardMaterial color={GOLD_COLOR} emissive={GOLD_COLOR} emissiveIntensity={2} />
+        </mesh>
+      )}
+
+      {[...Array(PHOTO_COUNT)].map((_, i) => (
+        <PolaroidPhoto key={i} index={i} total={PHOTO_COUNT} stateProgress={lerpVal.x} />
+      ))}
+    </group>
+  );
+};
+
+// --- 4. 主場景組件 ---
+export default function GrandLuxuryTreeApp() {
+  const { isOpen, handPos } = useHandTracking();
+
+  return (
+    <div className="w-full h-screen bg-[#02100a]">
+      {/* UI 提示 */}
+      <div className="absolute top-10 left-10 z-10 text-white font-serif">
+        <h1 className="text-4xl tracking-widest text-[#D4AF37]">TRUMP LUXURY CHRISTMAS</h1>
+        <p className="opacity-60">{isOpen ? "STATE: CHAOS" : "STATE: MAJESTIC"}</p>
+        <p className="text-xs mt-4">🖐 OPEN HAND TO UNLEASH | ✊ CLOSE TO FORM</p>
+      </div>
+
+      <Canvas shadows dpr={[1, 2]}>
+        <PerspectiveCamera makeDefault position={[0, 5, 25]} fov={35} />
+        <color attach="background" args={['#020806']} />
+        
+        <Environment preset="lobby" />
+        <ambientLight intensity={0.2} />
+        <spotLight position={[10, 20, 10]} angle={0.15} penumbra={1} color={GOLD_COLOR} intensity={2} />
+
+        <TreeParticles isOpen={isOpen} handPos={handPos} />
+
+        <Effects />
+      </Canvas>
+
+      {/* 底部奢華裝飾線 */}
+      <div className="absolute bottom-0 w-full h-1 bg-gradient-to-r from-transparent via-[#D4AF37] to-transparent" />
+    </div>
+  );
+}
+
+// 輔助組件：簡單的星星幾何體
+function starGeometry({ args = [0.5, 1.2, 5] }) {
+  const shape = new THREE.Shape();
+  // 星星形狀邏輯簡化... 
+  return <sphereGeometry args={[0.5, 32, 32]} />; // 暫用球體代替頂端光球
+}
+
+function Effects() {
+  return (
+    <EffectComposer disableNormalPass>
+      <Bloom luminanceThreshold={0.8} mipmapBlur intensity={1.5} radius={0.4} />
+      <Noise opacity={0.08} />
+      <Vignette eskil={false} offset={0.1} darkness={1.3} />
+    </EffectComposer>
+  );
+}
